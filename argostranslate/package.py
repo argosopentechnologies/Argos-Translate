@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import copy
 import json
+import pathlib
 import shutil
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 from threading import Lock
 
-import packaging.version
-
-from argostranslate import networking, settings
-from argostranslate.tokenizer import BPETokenizer, SentencePieceTokenizer
+import argostranslate.networking
+import argostranslate.settings
+from argostranslate.tokenizer import (BPETokenizer, SentencePieceTokenizer,
+                                      Tokenizer)
 from argostranslate.utils import error, info, warning
+
+# TODO: Upgrade packages
 
 """
 ## `package` module example usage
@@ -27,8 +31,7 @@ available_packages = package.get_available_packages()
 
 # Download and install all available packages
 for available_package in available_packages:
-    download_path = available_package.download()
-    package.install_from_path(download_path)
+    available_package.install()
 ```
 """
 
@@ -79,68 +82,28 @@ class IPackage:
     }
     """
 
-    code: str
-    package_path: Path
-    package_version: str
-    argos_version: str
-    from_code: str
-    from_name: str
-    from_codes: list
-    to_code: str
-    to_codes: list
-    to_name: str
-    links: list
-    type: str
-    languages: list
+    code: str | None
+    type: str | None
+    name: str | None
+    package_path: Path | None
+    package_version: str | None
+    argos_version: str | None
+    links: list[str]
     dependencies: list
+    languages: list
     source_languages: list
     target_languages: list
-    links: list[str]
+    from_code: str | None
+    from_name: str | None
+    to_code: str | None
+    to_name: str | None
+    target_prefix: str | None
 
     def load_metadata_from_json(self, metadata):
-        """Loads package metadata from a JSON object.
+        """Deprecated use set_metadata instead"""
+        self.set_metadata(metadata)
 
-        Args:
-            metadata: A json object from json.load
-
-        """
-        self.code = metadata.get("code")
-        self.package_version = metadata.get("package_version", "")
-        self.argos_version = metadata.get("argos_version", "")
-        self.from_code = metadata.get("from_code")
-        self.from_name = metadata.get("from_name", "")
-        self.from_codes = metadata.get("from_codes", list())
-        self.to_code = metadata.get("to_code")
-        self.to_codes = metadata.get("to_codes", list())
-        self.to_name = metadata.get("to_name", "")
-        self.links = metadata.get("links", list())
-        self.type = metadata.get("type", "translate")
-        self.languages = metadata.get("languages", list())
-        self.dependencies = metadata.get("dependencies", list())
-        self.source_languages = metadata.get("source_languages", list())
-        self.target_languages = metadata.get("target_languages", list())
-        self.target_prefix = metadata.get("target_prefix", "")
-
-        # Add all package source and target languages to
-        # source_languages and target_languages
-        if self.from_code is not None or self.from_name is not None:
-            from_lang = dict()
-            if self.from_code is not None:
-                from_lang["code"] = self.from_code
-            if self.from_name is not None:
-                from_lang["name"] = self.from_name
-            self.source_languages.append(from_lang)
-        if self.to_code is not None or self.to_name is not None:
-            to_lang = dict()
-            if self.to_code is not None:
-                to_lang["code"] = self.to_code
-            if self.to_name is not None:
-                to_lang["name"] = self.to_name
-            self.source_languages.append(to_lang)
-        self.source_languages += copy.deepcopy(self.languages)
-        self.target_languages += copy.deepcopy(self.languages)
-
-    def get_readme(self) -> str:
+    def get_readme(self):
         """Returns the text of the README.md in this package.
 
         Returns:
@@ -154,28 +117,179 @@ class IPackage:
         raise NotImplementedError()
 
     def __eq__(self, other):
-        return (
-            self.package_version == other.package_version
-            and self.argos_version == other.argos_version
-            and self.from_code == other.from_code
-            and self.from_name == other.from_name
-            and self.to_code == other.to_code
-            and self.to_name == other.to_name
-        )
-
-    def __repr__(self):
-        if len(self.from_name) > 0 and len(self.to_name) > 0:
-            return "{} -> {}".format(self.from_name, self.to_name)
-        elif self.type:
-            return self.type
-        return ""
+        return self.code == other.code
 
     def __str__(self):
-        return repr(self).replace("->", "→")
+        if self.name is not None:
+            return self.name
+        if self.code is not None:
+            return self.code
+        if self.type is not None:
+            return self.type
+        return "Argos Translate Package"
+
+    def __repr__(self):
+        if self.code is not None:
+            return self.code
+        return str(self)
 
 
-class Package(IPackage):
+class BasePackage(IPackage):
+    def set_metadata(self, metadata: dict):
+        """Loads package metadata from a JSON object.
+
+        Args:
+            metadata: A json object from json.load
+
+        """
+        info("Load metadata from package json", metadata)
+
+        self.code = metadata.get("code")
+        self.type = metadata.get("type")
+        self.name = metadata.get("name")
+        self.package_version = metadata.get("package_version")
+        self.argos_version = metadata.get("argos_version")
+        self.links = metadata.get("links", list())
+        self.dependencies = metadata.get("dependencies", list())
+        self.languages = metadata.get("languages", list())
+        self.source_languages = metadata.get("source_languages", list())
+        self.target_languages = metadata.get("target_languages", list())
+        self.from_code = metadata.get("from_code")
+        self.from_name = metadata.get("from_name")
+        self.to_code = metadata.get("to_code")
+        self.to_name = metadata.get("to_name")
+        self.target_prefix = metadata.get("target_prefix", "")
+
+        if (
+            self.code is None
+            and self.from_code is not None
+            and self.to_code is not None
+        ):
+            self.code = f"translate-{self.from_code}_{self.to_code}"
+
+        self.source_languages += copy.deepcopy(self.languages)
+        self.target_languages += copy.deepcopy(self.languages)
+        if self.from_code is not None:
+            from_lang = dict()
+            from_lang["code"] = self.from_code
+            if self.from_name is not None:
+                from_lang["name"] = self.from_name
+            self.languages.append(from_lang)
+            self.source_languages.append(from_lang)
+        if self.to_code is not None:
+            to_lang = dict()
+            to_lang["code"] = self.to_code
+            if self.to_name is not None:
+                to_lang["name"] = self.to_name
+            self.languages.append(to_lang)
+            self.target_languages.append(to_lang)
+
+        """Languages must have a code"""
+        self.source_languages = list(
+            filter(lambda lang: lang.get("code") is not None, self.source_languages)
+        )
+        self.target_languages = list(
+            filter(lambda lang: lang.get("code") is not None, self.target_languages)
+        )
+
+
+def update_package_index():
+    """Downloads remote package index"""
+    package_index_data = argostranslate.networking.get(
+        argostranslate.settings.remote_package_index
+    )
+    with package_lock:
+        with open(argostranslate.settings.local_package_index, "wb") as f:
+            f.write(package_index_data)
+
+
+def get_available_packages():
+    """Returns a list of AvailablePackages from the package index."""
+    if not argostranslate.settings.local_package_index.exists():
+        update_package_index()
+    with open(argostranslate.settings.local_package_index) as index_file:
+        index = json.load(index_file)
+        available_packages = list()
+        for metadata in index:
+            package = AvailablePackage(metadata)
+            available_packages.append(package)
+        info("get_available_packages", available_packages)
+        return available_packages
+
+
+def install_from_path(path: pathlib.Path):
+    """Install a package file (zip archive ending in .argosmodel).
+
+    Args:
+        path (pathlib): The path to the .argosmodel file to install.
+
+    """
+    with package_lock:
+        if not zipfile.is_zipfile(path):
+            raise Exception("Not a valid Argos Model (must be a zip archive)")
+        with zipfile.ZipFile(path, "r") as zip:
+            zip.extractall(path=argostranslate.settings.packages_dir)
+            info("Installed package from path", path)
+
+
+class AvailablePackage(BasePackage):
+    """A package available for download and installation"""
+
+    def __init__(self, metadata):
+        """Creates a new AvailablePackage from a metadata object"""
+        self.set_metadata(metadata)
+
+    def get_dependencies(self):
+        return list(
+            filter(
+                lambda available_package: available_package.code in self.dependencies,
+                get_available_packages(),
+            )
+        )
+
+    def download(self):
+        """Downloads the AvailablePackage and returns its path"""
+        if len(self.links) == 0:
+            return None
+        filename = f"{self.code}-{str(uuid.uuid4())}.argosmodel"
+        filepath = argostranslate.settings.downloads_dir / filename
+        data = argostranslate.networking.get_from(self.links)
+        if data is not None:
+            with open(filepath, "wb") as f:
+                f.write(data)
+            return filepath
+        return None
+
+    def install(self):
+        for dependency in self.get_dependencies():
+            dependency.install()
+        download_path = self.download()
+        if download_path is not None:
+            install_from_path(download_path)
+            download_path.unlink()
+
+    def get_description(self):
+        return self.name
+
+
+def version_parse(version_string):
+    parts = version_string.split(".")
+    parsed_version = []
+
+    for part in parts:
+        try:
+            parsed_version.append(int(part))
+        except ValueError:
+            parsed_version.append(part)
+
+    return tuple(parsed_version)
+
+
+class Package(BasePackage):
     """An installed package"""
+
+    package_path: Path
+    tokenizer: Tokenizer
 
     def __init__(self, package_path: Path):
         """Create a new Package from path.
@@ -184,9 +298,6 @@ class Package(IPackage):
             package_path: Path to installed package directory.
 
         """
-        if type(package_path) == str:
-            # Convert strings to pathlib.Path objects
-            package_path = Path(package_path)
         self.package_path = package_path
         metadata_path = package_path / "metadata.json"
         if not metadata_path.exists():
@@ -195,7 +306,15 @@ class Package(IPackage):
             )
         with open(metadata_path) as metadata_file:
             metadata = json.load(metadata_file)
-            self.load_metadata_from_json(metadata)
+            self.set_metadata(metadata)
+        if (
+            self.argos_version is not None
+            and self.argos_version > argostranslate.settings.argos_version
+        ):
+            warning(
+                f"Package version {self.argos_version} is newer than Argos Translate version {argostranslate.settings.argos_version}"
+            )
+            self.set_metadata(metadata)
 
         sp_model_path = package_path / "sentencepiece.model"
         bpe_model_path = package_path / "bpe.model"
@@ -203,6 +322,8 @@ class Package(IPackage):
         if sp_model_path.exists():
             self.tokenizer = SentencePieceTokenizer(sp_model_path)
         elif bpe_model_path.exists():
+            assert self.from_code is not None
+            assert self.to_code is not None
             self.tokenizer = BPETokenizer(bpe_model_path, self.from_code, self.to_code)
 
     def update(self):
@@ -212,9 +333,9 @@ class Package(IPackage):
                 available_package.from_code == self.from_code
                 and available_package.to_code == self.to_code
             ):
-                if packaging.version.parse(
-                    available_package.package_version
-                ) > packaging.version.parse(self.package_version):
+                if version_parse(available_package.package_version) > version_parse(
+                    self.package_version
+                ):
                     new_package_path = available_package.download()
                     uninstall(self)
                     install_from_path(new_package_path)
@@ -227,6 +348,8 @@ class Package(IPackage):
                 if README.md can't be read
 
         """
+        if self.package_path is None:
+            return None
         readme_path = self.package_path / "README.md"
         if not readme_path.exists():
             return None
@@ -237,75 +360,7 @@ class Package(IPackage):
         return self.get_readme()
 
 
-def install_from_path(path: Path):
-    """Install a package file (zip archive ending in .argosmodel).
-
-    Args:
-        path: The path to the .argosmodel file to install.
-
-    """
-    with package_lock:
-        if not zipfile.is_zipfile(path):
-            raise Exception("Not a valid Argos Model (must be a zip archive)")
-        with zipfile.ZipFile(path, "r") as zipf:
-            zipf.extractall(path=settings.package_data_dir)
-
-
-class AvailablePackage(IPackage):
-    """A package available for download and installation"""
-
-    def __init__(self, metadata):
-        """Creates a new AvailablePackage from a metadata object"""
-        self.load_metadata_from_json(metadata)
-
-    def download(self) -> Path:
-        """Downloads the AvailablePackage and returns its path"""
-        filename = argospm_package_name(self) + ".argosmodel"
-
-        # Install sbd package if needed
-        if self.type == "translate" and not settings.stanza_available:
-            if (
-                len(list(filter(lambda x: x.type == "sbd", get_installed_packages())))
-                == 0
-            ):
-                # No sbd packages are installed, download all available
-                sbd_packages = filter(
-                    lambda x: x.type == "sbd", get_available_packages()
-                )
-                for sbd_package in sbd_packages:
-                    download_path = sbd_package.download()
-                    install_from_path(download_path)
-
-        filepath = settings.downloads_dir / filename
-        if not filepath.exists():
-            data = networking.get_from(self.links)
-            if data is None:
-                raise Exception(f"Download failed for {str(self)}")
-            with open(filepath, "wb") as f:
-                f.write(data)
-        return filepath
-
-    def install(self):
-        download_path = self.download()
-        install_from_path(download_path)
-        download_path.unlink()
-
-    def get_description(self):
-        return "{} → {}".format(self.from_name, self.to_name)
-
-
-def uninstall(pkg: Package):
-    """Uninstalls a package.
-
-    Args:
-        pkg: The package to uninstall
-
-    """
-    with package_lock:
-        shutil.rmtree(pkg.package_path)
-
-
-def get_installed_packages(path: Path = None) -> list[Package]:
+def get_installed_packages(packages_dir: Path | None = None) -> list[Package]:
     """Return a list of installed Packages
 
     Looks for packages in <home>/.argos-translate/local/share/packages by
@@ -315,87 +370,37 @@ def get_installed_packages(path: Path = None) -> list[Package]:
 
     Args:
         path: Path to look for installed package directories in.
-            Defaults to the path in settings module.
+            Defaults to the path in argostranslate.settings.
 
     """
+    if packages_dir is None:
+        packages_dir = argostranslate.settings.packages_dir
     with package_lock:
-        to_return = []
-        packages_path = settings.package_dirs if path is None else path
-        for directory in packages_path:
-            for path in directory.iterdir():
-                if path.is_dir():
-                    to_return.append(Package(path))
-        return to_return
+        installed_packages = list()
+        for path in packages_dir.iterdir():
+            if path.is_dir():
+                installed_packages.append(Package(path))
+        info("get_installed_packages", installed_packages)
+        return installed_packages
 
 
-def update_package_index():
-    """Downloads remote package index"""
-    with package_lock:
-        try:
-            response = urllib.request.urlopen(settings.remote_package_index)
-        except Exception as err:
-            error(err)
-            return
-        data = response.read()
-        with open(settings.local_package_index, "wb") as f:
-            f.write(data)
-
-
-def get_available_packages() -> list[AvailablePackage]:
-    """Returns a list of AvailablePackages from the package index."""
-
-    try:
-        with open(settings.local_package_index) as index_file:
-            index = json.load(index_file)
-            packages = []
-            for metadata in index:
-                package = AvailablePackage(metadata)
-                packages.append(package)
-
-            # If stanza not available filter for sbd available
-            if not settings.stanza_available:
-                installed_and_available_packages = packages + get_installed_packages()
-                sbd_packages = list(
-                    filter(lambda x: x.type == "sbd", installed_and_available_packages)
-                )
-                sbd_available_codes = set()
-                for sbd_package in sbd_packages:
-                    sbd_available_codes = sbd_available_codes.union(
-                        sbd_package.from_codes
-                    )
-                packages = list(
-                    filter(lambda x: x.from_code in sbd_available_codes, packages)
-                )
-                return packages + sbd_packages
-
-            return packages
-    except FileNotFoundError:
-        update_package_index()
-        return get_available_packages()
-
-
-def argospm_package_name(pkg: IPackage) -> str:
-    """Gets argospm name of an IPackage.
+def uninstall(pkg):
+    """Uninstalls a package.
 
     Args:
-        The package to get the name of.
+        pkg (Package): The package to uninstall
 
-    Returns:
-        Package name for argospm
     """
-    to_return = pkg.type
-    if pkg.from_code and pkg.to_code:
-        to_return += "-" + pkg.from_code + "_" + pkg.to_code
-    return to_return
+    with package_lock:
+        info("Uninstalled package", pkg)
+        shutil.rmtree(pkg.package_path)
 
 
 def install_package_for_language_pair(from_code: str, to_code: str) -> bool:
     """Installs the necessary package to translate between a pair of languages
-
     Args:
         from_code (str): The ISO 639 code for the language being translated from
         to_code (str): The ISO 639 code for the language being translated to
-
     Returns:
         True if the package was installed successfully,
         False if the installation failed or was not possible
@@ -413,11 +418,3 @@ def install_package_for_language_pair(from_code: str, to_code: str) -> bool:
 
     install_from_path(package_to_install.download())
     return True
-
-
-def load_available_packages() -> list[Package]:
-    """Deprecated 1.2, use get_available_packages"""
-    info(
-        "Using deprecated function load_available_packages, use get_available_packages instead"
-    )
-    return get_available_packages()

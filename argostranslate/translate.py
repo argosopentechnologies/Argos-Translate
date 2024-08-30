@@ -1,25 +1,32 @@
 from __future__ import annotations
 
+import functools
 from typing import List
 
 import ctranslate2
-import sentencepiece as spm
-import stanza
-from ctranslate2 import Translator
+import sentencepiece
 
+import argostranslate
+import argostranslate.chunk
+import argostranslate.fewshot
+import argostranslate.models
+import argostranslate.package
+import argostranslate.settings
 from argostranslate import apis, fewshot, package, sbd, settings
-from argostranslate.models import ILanguageModel
 from argostranslate.package import Package
 from argostranslate.sbd import SpacySentencizerSmall
-from argostranslate.utils import info
+from argostranslate.utils import error, info, warning
 
+import torch
+from IndicTransToolkit import IndicProcessor
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 class Hypothesis:
     """Represents a translation hypothesis
 
     Attributes:
         value: The hypothetical translation value
-        score: The score representing the quality of the translation
+        score: The score representing the quality of the translation. Higher scores represent higher confidence in correctness.
     """
 
     value: str
@@ -32,11 +39,120 @@ class Hypothesis:
     def __lt__(self, other):
         return self.score < other.score
 
+    def __eq__(self, other):
+        return self.score == other.score and self.value == other.value
+
     def __repr__(self):
-        return f"({repr(self.value)}, {self.score})"
+        return f"{self.score} : " + self.value
 
     def __str__(self):
-        return repr(self)
+        return self.__repr__()
+
+
+class Language:
+    """Represents a language that can be translated from/to.
+
+    Attributes:
+        code: The code representing the language.
+        name: The human readable name of the language.
+        translations_from: A list of the translations
+            that translate from this language.
+        translations_to: A list of the translations
+            that translate to this language
+        indic: Boolean value
+            True: It is an Indian language.
+
+    """
+
+    translators_from: List[Translator]
+    translators_to: List[Translator]
+    translations_from: List[ITranslation]
+    translations_to: List[ITranslation]
+
+    def __init__(self, code: str, name: str, indic: bool = False):
+        self.code = code
+        self.name = name
+        self.translators_from = list()
+        self.translators_to = list()
+
+    def __str__(self):
+        return self.name
+
+    def __repr__(self):
+        return self.code
+
+    def __eq__(self, other):
+        return self.code == other.code
+
+    def get_translation(self, to: Language) -> ITranslation | None:
+        """Gets a translation from this Language to another Language.
+
+        Args:
+            to: The Language to look for a Translation to.
+
+        Returns:
+            A valid Translation if there is one in translations_from
+                else None.
+
+        """
+        for translator_from in self.translators_from:
+            translation = translator_from.get_translation(self, to)
+            if translation is not None:
+                return translation
+        return None
+
+class IndicTranslation(ITranslation):
+    """A custom translation class for translation from English to Indic languages."""
+
+    def __init__(self, to_lang: Language):
+        self.to_lang = to_lang
+        self.ip = IndicProcessor(inference=True)
+        self.tokenizer = AutoTokenizer.from_pretrained("ai4bharat/indictrans2-en-indic-dist-200M", trust_remote_code=True)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained("ai4bharat/indictrans2-en-indic-dist-200M", trust_remote_code=True)
+         
+
+    def translate_to_indic(self, text: str) -> str:
+        batch = self.ip.preprocess_batch([text], src_lang='eng_Latn', tgt_lang=self.to_lang)
+        batch = self.tokenizer(batch, padding="longest", truncation=True, max_length=256, return_tensors="pt")  
+        with torch.inference_mode():
+            outputs = self.model.generate(**batch, num_beams=5, num_return_sequences=1, max_length=256)
+        
+        with self.tokenizer.as_target_tokenizer():
+    # This scoping is absolutely necessary, as it will instruct the tokenizer to tokenize using the target vocabulary.
+    # Failure to use this scoping will result in gibberish/unexpected predictions as the output will be de-tokenized with the source vocabulary instead.
+            outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+        outputs = self.ip.postprocess_batch(outputs, lang=self.to_lang)
+
+        return outputs[0]
+                # Pivot through intermediate languages to add translations
+        # that don't already exist
+        # TODO
+        """
+        for language in languages:
+            keep_adding_translations = True
+            while keep_adding_translations:
+                keep_adding_translations = False
+                for translation in language.translations_from:
+                    for translation_2 in translation.to_lang.translations_from:
+                        if language.get_translation(translation_2.to_lang) is None:
+                            # The language currently doesn't have a way to translate
+                            # to this language
+                            keep_adding_translations = True
+                            composite_translation = CompositeTranslation(
+                                translation, translation_2
+                            )
+                            language.translations_from.append(composite_translation)
+                            translation_2.to_lang.translations_to.append(
+                                composite_translation
+                            )
+
+        # Add identity translations so everything can translate to itself
+        for language in languages:
+            identity_translation = IdentityTranslation(language)
+            language.translations_from.append(identity_translation)
+            language.translations_to.append(identity_translation)
+
+        """
 
 
 class ITranslation:
@@ -51,23 +167,25 @@ class ITranslation:
     from_lang: Language
     to_lang: Language
 
-    def translate(self, input_text: str) -> str:
+    def translate(self, from_text: str) -> str:
         """Translates a string from self.from_lang to self.to_lang
 
         Args:
-            input_text: The text to be translated.
+            from_text: The text to be translated.
 
         Returns:
-            input_text translated.
+            from_text translated.
 
         """
-        return self.hypotheses(input_text, num_hypotheses=1)[0].value
+        translation_result = self.hypotheses(from_text, num_hypotheses=1)[0].value
+        info("translation_result", translation_result)
+        return translation_result
 
-    def hypotheses(self, input_text: str, num_hypotheses: int = 4) -> list[Hypothesis]:
+    def hypotheses(self, from_text: str, num_hypotheses: int = 4) -> list[Hypothesis]:
         """Translates a string from self.from_lang to self.to_lang
 
         Args:
-            input_text: The text to be translated.
+            from_text: The text to be translated.
             num_hypotheses: Number of hypothetic results expected
 
         Returns:
@@ -76,32 +194,6 @@ class ITranslation:
         """
         raise NotImplementedError()
 
-    @staticmethod
-    def split_into_paragraphs(input_text: str) -> list[str]:
-        """Splits input_text into paragraphs and returns a list of paragraphs.
-
-        Args:
-            input_text: The text to be split.
-
-        Returns:
-            A list of paragraphs.
-
-        """
-        return input_text.split("\n")
-
-    @staticmethod
-    def combine_paragraphs(paragraphs: list[str]) -> str:
-        """Combines a list of paragraphs together.
-
-        Args:
-            paragraphs: A list of paragraphs.
-
-        Returns:
-            list of n paragraphs combined into one string.
-
-        """
-        return "\n".join(paragraphs)
-
     def __repr__(self):
         return str(self.from_lang) + " -> " + str(self.to_lang)
 
@@ -109,100 +201,8 @@ class ITranslation:
         return repr(self).replace("->", "→")
 
 
-class Language:
-    """Represents a language that can be translated from/to.
-
-    Attributes:
-        code: The code representing the language.
-        name: The human readable name of the language.
-        translations_from: A list of the translations
-            that translate from this language.
-        translations_to: A list of the translations
-            that translate to this language
-
-    """
-
-    translations_from: list[ITranslation] = []
-    translations_to: list[ITranslation] = []
-
-    def __init__(self, code: str, name: str):
-        self.code = code
-        self.name = name
-        self.translations_from = []
-        self.translations_to = []
-
-    def __str__(self):
-        return self.name
-
-    def get_translation(self, to: Language) -> ITranslation | None:
-        """Gets a translation from this Language to another Language.
-
-        Args:
-            to: The Language to look for a Translation to.
-
-        Returns:
-            A valid Translation if there is one in translations_from
-                else None.
-
-        """
-        valid_translations = list(
-            filter(lambda x: x.to_lang.code == to.code, self.translations_from)
-        )
-        if len(valid_translations) > 0:
-            return valid_translations[0]
-        return None
-
-
-class PackageTranslation(ITranslation):
-    """A Translation that is installed with a package"""
-
-    def __init__(self, from_lang: Language, to_lang: Language, pkg: Package):
-        self.from_lang = from_lang
-        self.to_lang = to_lang
-        self.pkg = pkg
-        self.translator = None
-        self.sentencizer = SpacySentencizerSmall()
-
-    def hypotheses(self, input_text: str, num_hypotheses: int = 4) -> list[Hypothesis]:
-        if self.translator is None:
-            model_path = str(self.pkg.package_path / "model")
-            self.translator = ctranslate2.Translator(
-                model_path,
-                device=settings.device,
-                inter_threads=settings.inter_threads,
-                intra_threads=settings.intra_threads,
-            )
-        paragraphs = ITranslation.split_into_paragraphs(input_text)
-        info("paragraphs:", paragraphs)
-        translated_paragraphs = []
-        for paragraph in paragraphs:
-            translated_paragraphs.append(
-                apply_packaged_translation(
-                    self.pkg,
-                    paragraph,
-                    self.translator,
-                    num_hypotheses,
-                    self.sentencizer,
-                )
-            )
-        info("translated_paragraphs:", translated_paragraphs)
-
-        # Construct new hypotheses using all paragraphs
-        hypotheses_to_return = [Hypothesis("", 0) for i in range(num_hypotheses)]
-        for i in range(num_hypotheses):
-            for translated_paragraph in translated_paragraphs:
-                value = ITranslation.combine_paragraphs(
-                    [hypotheses_to_return[i].value, translated_paragraph[i].value]
-                )
-                score = hypotheses_to_return[i].score + translated_paragraph[i].score
-                hypotheses_to_return[i] = Hypothesis(value, score)
-            hypotheses_to_return[i].value = hypotheses_to_return[i].value.lstrip("\n")
-        info("hypotheses_to_return:", hypotheses_to_return)
-        return hypotheses_to_return
-
-
 class IdentityTranslation(ITranslation):
-    """A Translation that doesn't modify input_text."""
+    """A Translation that doesn't modify from_text."""
 
     def __init__(self, lang: Language):
         """Creates an IdentityTranslation.
@@ -215,8 +215,8 @@ class IdentityTranslation(ITranslation):
         self.from_lang = lang
         self.to_lang = lang
 
-    def hypotheses(self, input_text: str, num_hypotheses: int = 4):
-        return [Hypothesis(input_text, 0) for i in range(num_hypotheses)]
+    def hypotheses(self, from_text: str, num_hypotheses: int = 4):
+        return [Hypothesis(from_text, 0) for i in range(num_hypotheses)]
 
 
 class CompositeTranslation(ITranslation):
@@ -245,12 +245,9 @@ class CompositeTranslation(ITranslation):
         self.from_lang = t1.from_lang
         self.to_lang = t2.to_lang
 
-    def hypotheses(self, input_text: str, num_hypotheses: int = 4) -> list[Hypothesis]:
-        t1_hypotheses = self.t1.hypotheses(input_text, num_hypotheses)
-
-        # Combine hypotheses
-        # O(n^2)
-        to_return = []
+    def hypotheses(self, from_text: str, num_hypotheses: int = 4) -> list[Hypothesis]:
+        t1_hypotheses = self.t1.hypotheses(from_text, num_hypotheses)
+        to_return = list()
         for t1_hypothesis in t1_hypotheses:
             t2_hypotheses = self.t2.hypotheses(t1_hypothesis.value, num_hypotheses)
             for t2_hypothesis in t2_hypotheses:
@@ -259,71 +256,8 @@ class CompositeTranslation(ITranslation):
                         t2_hypothesis.value, t1_hypothesis.score + t2_hypothesis.score
                     )
                 )
-        to_return.sort(reverse=True)
+        to_return.sort(reverse=True, key=lambda x: x.score)
         return to_return[0:num_hypotheses]
-
-
-class CachedTranslation(ITranslation):
-    """Caches a translation to improve performance.
-
-    This is done by splitting up the text passed for translation
-    into paragraphs and translating each paragraph individually.
-    A hash of the paragraphs and their corresponding translations
-    are saved from the previous translation and used to improve
-    performance on the next one. This is especially useful if you
-    are repeatedly translating nearly identical text with a small
-    change at the end of it.
-
-    """
-
-    underlying: ITranslation
-    from_lang: Language
-    to_lang: Language
-    cache: dict
-
-    def __init__(self, underlying: ITranslation):
-        """Creates a CachedTranslation.
-
-        Args:
-            underlying: The underlying translation to cache.
-        """
-        self.underlying = underlying
-        self.from_lang = underlying.from_lang
-        self.to_lang = underlying.to_lang
-        self.cache = dict()
-
-    def hypotheses(self, input_text: str, num_hypotheses: int = 4) -> list[Hypothesis]:
-        new_cache = dict()  # 'text': ['t1'...('tN')]
-        paragraphs = ITranslation.split_into_paragraphs(input_text)
-        translated_paragraphs = []
-        for paragraph in paragraphs:
-            translated_paragraph = self.cache.get(paragraph)
-            # If len() of our cached items are different than `num_hypotheses` it means that
-            # the search parameter is changed by caller, so we can't re-use cache, and should update it.
-            if (
-                translated_paragraph is None
-                or len(translated_paragraph) != num_hypotheses
-            ):
-                translated_paragraph = self.underlying.hypotheses(
-                    paragraph, num_hypotheses
-                )
-            new_cache[paragraph] = translated_paragraph
-            translated_paragraphs.append(translated_paragraph)
-        self.cache = new_cache
-
-        # Construct hypotheses
-        hypotheses_to_return = [Hypothesis("", 0) for i in range(num_hypotheses)]
-        for i in range(num_hypotheses):
-            for j in range(len(translated_paragraphs)):
-                value = ITranslation.combine_paragraphs(
-                    [hypotheses_to_return[i].value, translated_paragraphs[j][i].value]
-                )
-                score = (
-                    hypotheses_to_return[i].score + translated_paragraphs[j][i].score
-                )
-                hypotheses_to_return[i] = Hypothesis(value, score)
-            hypotheses_to_return[i].value = hypotheses_to_return[i].value.lstrip("\n")
-        return hypotheses_to_return
 
 
 class RemoteTranslation(ITranslation):
@@ -337,324 +271,233 @@ class RemoteTranslation(ITranslation):
         self.to_lang = to_lang
         self.api = api
 
-    def hypotheses(self, input_text: str, num_hypotheses: int = 1) -> list[Hypothesis]:
+    def hypotheses(self, from_text: str, num_hypotheses: int = 1) -> list[Hypothesis]:
         """LibreTranslate only supports single hypotheses.
 
+        TODO LibreTranslate now supports multiple hypotheses
         A list of length num_hypotheses will be returned with identical hypotheses.
         """
-        result = self.api.translate(input_text, self.from_lang.code, self.to_lang.code)
+        result = self.api.translate(from_text, self.from_lang.code, self.to_lang.code)
         return [Hypothesis(result, 0)] * num_hypotheses
 
 
-# Backwards compatibility, renamed in 1.8
-LibreTranslateTranslation = RemoteTranslation
+def get_chunk_package(from_code):
+    packages = argostranslate.package.get_installed_packages()
+    CHUNK_LANG_CODE = "chunk"
+    AUTO_LANG_CODE = "auto"
+    for package in packages:
+        for package_target_language in package.target_languages:
+            if package_target_language["code"] == CHUNK_LANG_CODE:
+                for package_source_language in package.source_languages:
+                    if package_source_language["code"] in [from_code, AUTO_LANG_CODE]:
+                        info("get_chunk_package", from_code, package)
+                        return package
+    info("get_chunk_package", from_code, None)
+    return None
 
 
-class FewShotTranslation(ITranslation):
-    """A translation performed with a few shot language model"""
-
-    from_lang: Language
-    to_lang: Language
-    language_model: ILanguageModel
-
-    def __init__(
-        self, from_lang: Language, to_lang: Language, language_model: ILanguageModel
+def chunk(from_text, from_code):
+    # TODO Support Spacy
+    if argostranslate.settings.chunk_type == argostranslate.settings.ChunkType.NONE:
+        return [from_text]
+    elif (
+        argostranslate.settings.chunk_type
+        == argostranslate.settings.ChunkType.ARGOSTRANSLATE
     ):
+        chunk_package = get_chunk_package(from_code)
+        if chunk_package is None:
+            warning("Could not find chunk package", from_code)
+            return [from_text]
+
+        model_path = str(chunk_package.package_path / "model")
+        ctranslate2_translator = ctranslate2.Translator(
+            model_path, device=argostranslate.settings.device
+        )
+        sp_model_path = str(chunk_package.package_path / "sentencepiece.model")
+        sp_processor = sentencepiece.SentencePieceProcessor(
+            model_file=sp_model_path, out_type=str
+        )
+
+        def apply_chunk_translation(from_text, ctranslate2_translator, sp_processor):
+            MAX_CHUNK_LENGTH = 300  # TODO: make this configurable
+            from_text = from_text[:MAX_CHUNK_LENGTH]
+
+            tokenized = sp_processor.encode(from_text)
+            translation_results = ctranslate2_translator.translate_batch(
+                [tokenized],
+            )
+            translated_tokens = translation_results[0].hypotheses[0]
+            return sp_processor.decode(translated_tokens)
+
+        chunk_translation = functools.partial(
+            apply_chunk_translation,
+            ctranslate2_translator=ctranslate2_translator,
+            sp_processor=sp_processor,
+        )
+
+        sentences = argostranslate.chunk.chunk(from_text, chunk_translation)
+        info("sentences", sentences)
+        return sentences
+    else:
+        error("Unknown chunk type", argostranslate.settings.chunk_type)
+        return [from_text]
+
+
+class Translator:
+    def __init__(self, pkg: argostranslate.package.Package):
+        # TODO: Cache to prevent memory leaks
+        self.pkg = pkg
+        self.source_languages = [
+            Language(language["code"], language["name"])
+            for language in self.pkg.source_languages
+        ]
+        self.target_languages = [
+            Language(language["code"], language["name"])
+            for language in self.pkg.target_languages
+        ]
+        self.model_path = self.pkg.package_path / "model"
+        self.translator = ctranslate2.Translator(
+            str(self.model_path), device=argostranslate.settings.device
+        )
+        self.sp_model_path = self.pkg.package_path / "sentencepiece.model"
+        self.sp_processor = sentencepiece.SentencePieceProcessor(
+            model_file=str(self.sp_model_path)
+        )
+
+    def tokenize(self, from_text: str) -> List[str]:
+        tokenized = self.sp_processor.encode(from_text, out_type=str)
+        info("tokenized", tokenized)
+        return tokenized
+
+    def detokenize(self, tokens: List[str]) -> str:
+        return self.sp_processor.decode(tokens)
+
+    def remove_target_prefix(self, translated_tokens):
+        if self.pkg.target_prefix != "" and self.pkg.target_prefix is not None:
+            if translated_tokens[0] == self.pkg.target_prefix:
+                return translated_tokens[1:]
+        return translated_tokens
+
+    def translate(self, from_text, from_code, to_code, num_hypotheses):
+        # Split sentences
+        sentences = chunk(from_text, from_code)
+
+        # Tokenize
+        tokenized_sentences = [self.tokenize(sentence) for sentence in sentences]
+
+        BATCH_SIZE = 32
+
+        # TODO support BPE
+
+        if self.pkg.target_prefix is not None and self.pkg.target_prefix != "":
+            target_prefix = [[self.pkg.target_prefix]] * len(tokenized_sentences)
+        else:
+            target_prefix = list()
+
+        # Translate
+        translation_results = self.translator.translate_batch(
+            tokenized_sentences,
+            target_prefix=target_prefix,
+            replace_unknowns=True,
+            max_batch_size=BATCH_SIZE,
+            beam_size=max(num_hypotheses, 4),
+            num_hypotheses=num_hypotheses,
+            length_penalty=0.2,
+            return_scores=True,
+        )
+        info("translation_results", translation_results)
+
+        # Build hypotheses
+        hypotheses = list()
+        for i in range(num_hypotheses):
+            translated_tokens = list()
+            cumulative_score = 0
+            for translation_result in translation_results:
+                translated_tokens += self.remove_target_prefix(
+                    translation_result.hypotheses[i]
+                )
+                cumulative_score += translation_result.scores[i]
+            hypothesis_value = self.detokenize(translated_tokens)
+            hypothesis_score = cumulative_score / len(translation_results)
+            hypothesis = Hypothesis(hypothesis_value, hypothesis_score)
+            hypotheses.append(hypothesis)
+        info("hypotheses", hypotheses)
+        return hypotheses
+
+    def get_translation(self, from_lang, to_lang):
+        if from_lang not in self.source_languages:
+            return None
+        if to_lang not in self.target_languages:
+            return None
+        return LocalTranslation(self, from_lang, to_lang)
+
+
+class LocalTranslation(ITranslation):
+    def __init__(self, translator, from_lang, to_lang):
+        self.translator = translator
         self.from_lang = from_lang
         self.to_lang = to_lang
-        self.language_model = language_model
 
-    def hypotheses(self, input_text: str, num_hypotheses: int = 1) -> list[Hypothesis]:
-        # Split into sentences
-        DEFAULT_SENTENCE_LENGTH = 250
-        sentences = []
-        start_index = 0
-        while start_index < len(input_text) - 1:
-            prompt = sbd.generate_fewshot_sbd_prompt(input_text[start_index:])
-            response = sbd.parse_fewshot_response(self.language_model.infer(prompt))
-            detected_sentence_index = sbd.process_seq2seq_sbd(
-                input_text[start_index:], response
-            )
-            if detected_sentence_index == -1:
-                # Couldn't find sentence boundary
-                sbd_index = start_index + DEFAULT_SENTENCE_LENGTH
-            else:
-                sbd_index = start_index + detected_sentence_index
-            sentences.append(input_text[start_index:sbd_index])
-            info("start_index", start_index)
-            info("sbd_index", sbd_index)
-            info(input_text[start_index:sbd_index])
-            start_index = sbd_index
-
-        to_return = ""
-        for sentence in sentences:
-            prompt = fewshot.generate_prompt(
-                sentence,
-                self.from_lang.name,
-                self.from_lang.code,
-                self.to_lang.name,
-                self.to_lang.code,
-            )
-            info("fewshot prompt", prompt)
-            response = self.language_model.infer(prompt)
-            info("fewshot response", response)
-            result = fewshot.parse_inference(response)
-            info("fewshot result", result)
-            to_return += result
-        return [Hypothesis(to_return, 0)] * num_hypotheses
-
-
-def apply_packaged_translation(
-    pkg: Package,
-    input_text: str,
-    translator: Translator,
-    num_hypotheses: int = 4,
-    sentencizer: sbd.ISentenceBoundaryDetectionModel = SpacySentencizerSmall(),
-) -> list[Hypothesis]:
-    """Applies the translation in pkg to translate input_text.
-
-    Args:
-        pkg: The package that provides the translation.
-        input_text: The text to be translated.
-        translator: The CTranslate2 Translator
-        num_hypotheses: The number of hypotheses to generate
-
-    Returns:
-        A list of Hypothesis's for translating input_text
-
-    """
-
-    info("apply_packaged_translation", input_text)
-
-    # Sentence boundary detection
-    """
-    # Argos Translate 1.9 Sentence Boundary Detection
-    if pkg.type == "sbd":
-        sentences = [input_text]
-    elif settings.stanza_available:
-        # PJDEBUG
-        stanza_pipeline = stanza.Pipeline(
-            lang=pkg.from_code,
-            dir=str(pkg.package_path / "stanza"),
-            processors="tokenize",
-            use_gpu=settings.device == "cuda",
-            logging_level="WARNING",
+    def hypotheses(self, from_text, num_hypotheses=4):
+        return self.translator.translate(
+            from_text, self.from_lang.code, self.to_lang.code, num_hypotheses
         )
-        stanza_sbd = stanza_pipeline(input_text)
-        sentences = [sentence.text for sentence in stanza_sbd.sentences]
-    else:
-        DEFAULT_SENTENCE_LENGTH = 250
-        sentences = []
-        start_index = 0
-
-        # Get sbd translation
-        sbd_package = sbd.get_sbd_package()
-        assert sbd_package is not None
-        sbd_translation = PackageTranslation(None, None, sbd_package)
-
-        while start_index < len(input_text) - 1:
-            detected_sentence_index = sbd.detect_sentence(
-                input_text[start_index:], sbd_translation
-            )
-            if detected_sentence_index == -1:
-                # Couldn't find sentence boundary
-                sbd_index = start_index + DEFAULT_SENTENCE_LENGTH
-            else:
-                sbd_index = start_index + detected_sentence_index
-            sentences.append(input_text[start_index:sbd_index])
-            info("start_index", start_index)
-            info("sbd_index", sbd_index)
-            info(input_text[start_index:sbd_index])
-            start_index = sbd_index
-    """
-    sentences = sentencizer.split_sentences(input_text)
-
-    info("sentences", sentences)
-
-    # Tokenization
-    tokenized = [pkg.tokenizer.encode(sentence) for sentence in sentences]
-    info("tokenized", tokenized)
-
-    # Translation
-    BATCH_SIZE = 32
-    target_prefix = None
-
-    if pkg.target_prefix != "":
-        target_prefix = [[pkg.target_prefix]] * len(tokenized)
-
-    translated_batches = translator.translate_batch(
-        tokenized,
-        target_prefix=target_prefix,
-        replace_unknowns=True,
-        max_batch_size=BATCH_SIZE,
-        beam_size=max(num_hypotheses, 4),
-        num_hypotheses=num_hypotheses,
-        length_penalty=0.2,
-        return_scores=True,
-    )
-    info("translated_batches", translated_batches)
-
-    # Build hypotheses
-    value_hypotheses = []
-    for i in range(num_hypotheses):
-        translated_tokens = []
-        cumulative_score = 0
-        for translated_batch in translated_batches:
-            translated_tokens += translated_batch.hypotheses[i]
-            cumulative_score += translated_batch.scores[i]
-
-        value = pkg.tokenizer.decode(translated_tokens)
-
-        if pkg.target_prefix != "" and value.startswith(pkg.target_prefix):
-            # Remove target prefix
-            value = value[len(pkg.target_prefix) :]
-
-        if len(value) > 0 and value[0] == " ":
-            # Remove space at the beginning of the translation added
-            # by the tokenizer.
-            value = value[1:]
-
-        hypothesis = Hypothesis(value, cumulative_score)
-        value_hypotheses.append(hypothesis)
-    info("value_hypotheses:", value_hypotheses)
-    return value_hypotheses
-
-
-class InstalledTranslate:
-    """
-    Global storage of instances of the CachedTranslation class by unique keys.
-    To avoid creating unnecessary objects in memory.
-    """
-
-    package_key: str
-    cached_translation: CachedTranslation
-
-
-installed_translates: List[InstalledTranslate] = []
 
 
 def get_installed_languages() -> list[Language]:
     """Returns a list of Languages installed from packages"""
 
-    info("get_installed_languages")
+    if (
+        argostranslate.settings.model_provider
+        == argostranslate.settings.ModelProvider.OPENNMT
+    ):
+        packages = argostranslate.package.get_installed_packages()
 
-    if settings.model_provider == settings.ModelProvider.OPENNMT:
-        packages = package.get_installed_packages()
-
-        # If stanza not available filter for sbd available
-        if not settings.stanza_available:
-            sbd_packages = list(filter(lambda x: x.type == "sbd", packages))
-            sbd_available_codes = set()
-            for sbd_package in sbd_packages:
-                sbd_available_codes = sbd_available_codes.union(sbd_package.from_codes)
-            packages = list(
-                filter(lambda x: x.from_code in sbd_available_codes, packages)
-            )
-
-        # Filter for translate packages
-        packages = list(filter(lambda x: x.type == "translate", packages))
+        packages = list(filter(lambda x: x.type != "chunk", packages))
 
         # Load languages and translations from packages
         language_of_code = dict()
         for pkg in packages:
-            if pkg.from_code not in language_of_code:
-                language_of_code[pkg.from_code] = Language(pkg.from_code, pkg.from_name)
-            if pkg.to_code not in language_of_code:
-                language_of_code[pkg.to_code] = Language(pkg.to_code, pkg.to_name)
-            from_lang = language_of_code[pkg.from_code]
-            to_lang = language_of_code[pkg.to_code]
-
-            package_key = f"{pkg.from_code}-{pkg.to_code}"
-            contain = list(
-                filter(lambda x: x.package_key == package_key, installed_translates)
-            )
-            translation_to_add: CachedTranslation
-            if len(contain) == 0:
-                translation_to_add = CachedTranslation(
-                    PackageTranslation(from_lang, to_lang, pkg)
-                )
-                saved_cache = InstalledTranslate()
-                saved_cache.package_key = package_key
-                saved_cache.cached_translation = translation_to_add
-                installed_translates.append(saved_cache)
-            else:
-                translation_to_add = contain[0].cached_translation
-
-            from_lang.translations_from.append(translation_to_add)
-            to_lang.translations_to.append(translation_to_add)
+            translator = Translator(pkg)
+            for source_language in pkg.source_languages:
+                if source_language["code"] not in language_of_code:
+                    language_of_code[source_language["code"]] = Language(
+                        source_language["code"], source_language["name"]
+                    )
+                    language_of_code[source_language["code"]].translators_from.append(
+                        translator
+                    )
+            for target_language in pkg.target_languages:
+                if target_language["code"] not in language_of_code:
+                    language_of_code[target_language["code"]] = Language(
+                        target_language["code"], target_language["name"]
+                    )
+                    language_of_code[target_language["code"]].translators_to.append(
+                        translator
+                    )
 
         languages = list(language_of_code.values())
-
-        # Add translations so everything can translate to itself
-        for language in languages:
-            identity_translation = IdentityTranslation(language)
-            language.translations_from.append(identity_translation)
-            language.translations_to.append(identity_translation)
-
-        # Pivot through intermediate languages to add translations
-        # that don't already exist
-        for language in languages:
-            keep_adding_translations = True
-            while keep_adding_translations:
-                keep_adding_translations = False
-                for translation in language.translations_from:
-                    for translation_2 in translation.to_lang.translations_from:
-                        if language.get_translation(translation_2.to_lang) is None:
-                            # The language currently doesn't have a way to translate
-                            # to this language
-                            keep_adding_translations = True
-                            composite_translation = CompositeTranslation(
-                                translation, translation_2
-                            )
-                            language.translations_from.append(composite_translation)
-                            translation_2.to_lang.translations_to.append(
-                                composite_translation
-                            )
-
-    elif settings.model_provider == settings.ModelProvider.LIBRETRANSLATE:
+    elif (
+        argostranslate.settings.model_provider
+        == argostranslate.settings.ModelProvider.LIBRETRANSLATE
+    ):
         # TODO: Add API key and custom URL support
-        libretranslate_api = apis.LibreTranslateAPI()
+        libretranslate_api = argostranslate.apis.LibreTranslateAPI()
         supported_languages = (
             libretranslate_api.languages()
         )  # [{"code":"en", "name":"English"}]
         languages = [Language(l["code"], l["name"]) for l in supported_languages]
         for from_lang in languages:
             for to_lang in languages:
-                translation = LibreTranslateTranslation(
+                remote_translation = RemoteTranslation(
                     from_lang, to_lang, libretranslate_api
                 )
-                from_lang.translations_from.append(translation)
-                to_lang.translations_to.append(translation)
+                from_lang.translations_from.append(remote_translation)
+                to_lang.translations_to.append(remote_translation)
 
-    elif settings.model_provider == settings.ModelProvider.OPENAI:
-        language_model = apis.OpenAIAPI(settings.openai_api_key)
-        # TODO
-        languages = [Language("en", "English"), Language("es", "Spanish")]
-        for from_lang in languages:
-            for to_lang in languages:
-                translation = FewShotTranslation(from_lang, to_lang, language_model)
-                from_lang.translations_from.append(translation)
-                to_lang.translations_to.append(translation)
-
-    # Put English first if available so it shows up as the from language in the gui
-    en_index = None
-    for i, language in enumerate(languages):
-        if language.code == "en":
-            en_index = i
-            break
-    english = None
-    if en_index is not None:
-        english = languages.pop(en_index)
-    languages.sort(key=lambda x: x.name)
-    if english is not None:
-        languages = [english] + languages
+    info("languages", languages)
 
     return languages
-
-
-def load_installed_languages() -> list[Language]:
-    """Deprecated 1.2, use get_installed_languages"""
-    return get_installed_languages()
 
 
 def get_language_from_code(code: str) -> Language | None:
@@ -667,12 +510,18 @@ def get_language_from_code(code: str) -> Language | None:
         code: The ISO 639 code of the language
 
     Returns:
-        The language object
+        The language object or None if no language is available
     """
-    return next(filter(lambda x: x.code == code, get_installed_languages()), None)
+    try:
+        return next(
+            filter(lambda language: language.code == code, get_installed_languages())
+        )
+    except StopIteration:
+        warning(f"Language with code {code} not found")
+        return None
 
 
-def get_translation_from_codes(from_code: str, to_code: str) -> ITranslation:
+def get_translation_from_codes(from_code: str, to_code: str) -> ITranslation | None:
     """Gets a translation object from codes for from and to languages
 
     An exception will be thrown if an installed translation between the from lang
@@ -683,14 +532,19 @@ def get_translation_from_codes(from_code: str, to_code: str) -> ITranslation:
         to_code: The ISO 639 code of the target language
 
     Returns:
-        The translation object
+        The translation object or None if no translation is available
     """
+
     from_lang = get_language_from_code(from_code)
+   
     to_lang = get_language_from_code(to_code)
+    if from_lang is None or to_lang is None:
+        warning(f"Translation from {from_code} to {to_code} not found")
+        return None
     return from_lang.get_translation(to_lang)
 
 
-def translate(q: str, from_code: str, to_code: str) -> str:
+def translate(q: str, from_code: str, to_code: str) -> str | None:
     """Translate a string of text
 
     Args:
@@ -699,7 +553,49 @@ def translate(q: str, from_code: str, to_code: str) -> str:
         to_code: The ISO 639 code of the target language
 
     Returns:
-        The translated text
+        The translated text or None if no translation is available
     """
+    indic = [
+  "asm_Beng",
+  "kas_Arab",
+  "pan_Guru",
+  "ben_Beng",
+  "kas_Deva",
+  "san_Deva",
+  "brx_Deva",
+  "mai_Deva",
+  "sat_Olck",
+  "doi_Deva",
+  "mal_Mlym",
+  "snd_Arab",
+  "mar_Deva",
+  "snd_Deva",
+  "gom_Deva",
+  "mni_Beng",
+  "tam_Taml",
+  "guj_Gujr",
+  "mni_Mtei",
+  "tel_Telu",
+  "hin_Deva",
+  "npi_Deva",
+  "urd_Arab",
+  "kan_Knda",
+  "ory_Orya"
+    ]
+    if to_code in indic and from_code == "en":
+        indic = IndicTranslation(to_code)
+        op = indic.translate_to_indic(q)
+        return op
+
+
+
     translation = get_translation_from_codes(from_code, to_code)
+    if translation is None:
+        warning(
+            f"Translation failed - Translation from {from_code} to {to_code} not found"
+        )
+        return None
     return translation.translate(q)
+
+
+# TODO: Add translate_json function

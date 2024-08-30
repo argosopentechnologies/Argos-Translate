@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from argostranslate.translate import ITranslation
+import difflib
+import typing
+
+import argostranslate.translate
 from argostranslate.utils import info
 
 """
@@ -9,7 +12,7 @@ from argostranslate.tags import translate_tags, Tag
 from argostranslate import translate
 
 installed_languages = translate.get_installed_languages()
-translation = installed_languages[0].get_translation(installed_languages[1])
+translation = argostranslate.translate.get_translation_from_codes("en", "es")
 
 t = Tag(['I went to ', Tag(['Paris']), ' last summer.'])
 
@@ -30,6 +33,7 @@ class ITag:
     """
 
     translateable: bool
+    children: list[ITag | str]
 
     def text(self) -> str:
         """The combined text of all of the children
@@ -39,19 +43,32 @@ class ITag:
         """
         raise NotImplementedError()
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ITag):
+            return False
+        if len(self.children) != len(other.children):
+            return False
+        return all(
+            [self.children[i] == other.children[i] for i in range(len(self.children))]
+        )
+
     def __str__(self) -> str:
         return f'{str(type(self))} "{str(self.children)}"'
 
 
 class Tag(ITag):
-    def __init__(self, children: ITag | str, translateable: bool = True):
+    def __init__(self, children: list[ITag | str], translateable: bool = True):
         self.children = children
         self.translateable = translateable
 
     def text(self) -> str:
-        return "".join(
-            [(child.text() if type(child) != str else child) for child in self.children]
-        )
+        def child_to_str(child: ITag | str) -> str:
+            if isinstance(child, ITag):
+                return child.text()
+            else:
+                return child
+
+        return "".join([child_to_str(child) for child in self.children])
 
 
 def depth(tag: ITag | str) -> int:
@@ -62,153 +79,167 @@ def depth(tag: ITag | str) -> int:
     Args:
         tag: The ITag or string to get the depth of.
     """
-    if type(tag) is str:
+    if isinstance(tag, str):
         return 0
     if len(tag.children) == 0:
         return 0
-    return max([depth(t) for t in tag.children])
+    return max([depth(t) for t in tag.children]) + 1
 
 
-def translate_preserve_formatting(
-    underlying_translation: ITranslation, input_text: str
-) -> str:
-    """Translates but preserves a space if it exists on either end of translation.
-    Args:
-        underlying_translation : The translation to apply
-        input_text: The text to translate
-    Returns:
-        The translated text
-    """
-    translated_text = underlying_translation.translate(input_text)
-    if len(input_text) > 0:
-        if input_text[0] == " " and not (
-            len(translated_text) > 0 and translated_text[0] == " "
-        ):
-            translated_text = " " + translated_text
-        if input_text[-1] == " " and not (
-            len(translated_text) > 0 and translated_text[-1] == " "
-        ):
-            translated_text = translated_text + " "
-    return translated_text
-
-
-def inject_tags_inference(
-    underlying_translation: ITranslation, tag: ITag
-) -> ITag | None:
-    """Returns translated tag tree with injection tags, None if not possible
-
-    tag is only modified in place if tag injection is successful.
+def is_same_structure(tag1: ITag | str, tag2: ITag | str) -> bool:
+    """Checks if two tags have the same structure
 
     Args:
-        underlying_translation: The translation to apply to the tags.
-        tag: A depth=2 tag tree to attempt injection on.
+        tag1: The first tag to compare
+        tag2: The second tag to compare
 
     Returns:
-        A translated version of tag, None if not possible to tag inject
+        True if the tags have the same structure, false otherwise
     """
-    MAX_SEQUENCE_LENGTH = 200
+    if isinstance(tag1, str) and isinstance(tag2, str):
+        return True
+    elif isinstance(tag1, str) or isinstance(tag2, str):
+        return False
+    elif len(tag1.children) != len(tag2.children):
+        return False
+    else:
+        return all(
+            [
+                is_same_structure(tag1.children[i], tag2.children[i])
+                for i in range(len(tag1.children))
+            ]
+        )
 
-    text = tag.text()
-    if len(text) > MAX_SEQUENCE_LENGTH:
+
+ARGOS_OPEN_TAG = "<argos-tag>"
+ARGOS_CLOSE_TAG = "</argos-tag>"
+
+GOLDEN_RATIO = (1 + 5 ** 0.5) / 2
+
+
+def flatten_tag(tag: ITag) -> str:
+    """Flattens an ITag into a string"""
+    flat = str()
+    for child in tag.children:
+        if isinstance(child, str):
+            flat += child
+        else:
+            flat += f"{ARGOS_OPEN_TAG}{child.text()}{ARGOS_CLOSE_TAG}"
+    return flat
+
+
+def unflatten_tag(flat_tag: str) -> ITag | None:
+    """Unflattens a string into an depth=2 ITag
+
+    Returns None if the string is not a valid flattened depth=2 tag
+    """
+    unflattened = Tag(list())
+    while len(flat_tag) > 0:
+        open_tag_index = flat_tag.find(ARGOS_OPEN_TAG)
+        if open_tag_index == -1:
+            unflattened.children.append(flat_tag)
+            flat_tag = ""
+            break
+        elif open_tag_index > 0:
+            unflattened.children.append(flat_tag[:open_tag_index])
+            flat_tag = flat_tag[open_tag_index:]
+        else:
+            closing_tag_index = flat_tag.find(ARGOS_CLOSE_TAG)
+            tag_inner_text = flat_tag[
+                open_tag_index + len(ARGOS_OPEN_TAG) : closing_tag_index
+            ]
+            unflattened.children.append(Tag([tag_inner_text]))
+            flat_tag = flat_tag[closing_tag_index + len(ARGOS_CLOSE_TAG) :]
+
+    if depth(unflattened) != 2:
         return None
 
-    translated_text = translate_preserve_formatting(underlying_translation, text)
+    return unflattened
 
-    class InjectionTag:
-        """
 
-        Attributes:
-            text: The text of the tag
-            tag: The depth 1 ITag it represents
-            injection_index: The index in the outer translated string that
-                    this tag can be injected into.
-        """
+def translate_tag_chunk(
+    translation: argostranslate.translate.ITranslation, tag: ITag
+) -> ITag | None:
+    """Translate an ITag with depth(tag) == 2
 
-        def __init__(self, text: str, tag: ITag):
-            self.text = text
-            self.tag = tag
-            self.injection_index = None
+    Args:
+        translation: The translation to use to translate the tag
+        tag: The tag to translate
 
-    injection_tags = []
-    for child in tag.children:
-        if depth(child) == 1:
-            translated = translate_preserve_formatting(
-                underlying_translation, child.text()
-            )
-            injection_tags.append(InjectionTag(translated, child))
-        elif type(child) is not str:
-            info("inject_tags_inference", "can't inject depth 0 ITag")
-            return None
+    Returns:
+        The translated tag, or None if the translation failed
 
-    for injection_tag in injection_tags:
-        injection_index = translated_text.find(injection_tag.text)
-        if injection_index != -1:
-            injection_tag.injection_index = injection_index
-        else:
-            info(
-                "inject_tags_inference",
-                "injection text not found in translated text",
-                translated_text,
-                injection_tag.text,
-            )
-            return None
+    This function attempts to use context from nearby text to translate a tag with depth 2.
 
-    # Check for overlap
-    injection_tags.sort(key=lambda x: x.injection_index)
-    for i in range(len(injection_tags) - 1):
-        injection_tag = injection_tags[i]
-        next_injection_tag = injection_tags[i + 1]
-        if (
-            injection_tag.injection_index + len(injection_tag.text)
-            >= next_injection_tag.injection_index
+    If it fails to find a translation better than the default of translating each tag individually,
+    None is returned.
+
+    If successful, the tag is modified in place and returned. If None is returned, the tag is not modified.
+
+    """
+    assert depth(tag) == 2
+
+    # Attempt translation with flattened tags
+    # Example:
+    # I have a <argos-tag>house</argos-tag>
+
+    translated_prompt = translation.translate(flatten_tag(tag))
+    translated_tag_attempt = unflatten_tag(translated_prompt)
+
+    if translated_tag_attempt is None:
+        return None
+
+    if not is_same_structure(tag, translated_tag_attempt):
+        info(
+            "Tags have different structure after translation",
+            tag,
+            translated_tag_attempt,
+        )
+        return None
+
+    # Check translation attempt is similar to translation without tags
+    translated_without_tags = translation.translate(tag.text())
+    similarity_between_attemted_translation_and_without_tags = difflib.SequenceMatcher(
+        None, translated_tag_attempt.text(), translated_without_tags
+    ).ratio()
+    if similarity_between_attemted_translation_and_without_tags < 1 / GOLDEN_RATIO:
+        return None
+
+    # Copy the translated_tag values into the original tag
+    for i in range(len(tag.children)):
+        if isinstance(tag.children[i], Tag) and isinstance(
+            translated_tag_attempt.children[i], Tag
         ):
-            info(
-                "inject_tags_inference",
-                "injection tags overlap",
-                injection_tag,
-                next_injection_tag,
-            )
-            return None
-
-    to_return = []
-    i = 0
-    for injection_tag in injection_tags:
-        if i < injection_tag.injection_index:
-            to_return.append(translated_text[i : injection_tag.injection_index])
-        to_return.append(injection_tag.tag)
-        i = injection_tag.injection_index + len(injection_tag.text)
-    if i < len(translated_text):
-        to_return.append(translated_text[i:])
-
-    tag.children = to_return
-
+            typing.cast(ITag, tag.children[i]).children = typing.cast(
+                ITag, translated_tag_attempt.children[i]
+            ).children
+        elif isinstance(tag.children[i], str):
+            tag.children[i] = translated_tag_attempt.children[i]
     return tag
 
 
-def translate_tags(underlying_translation: ITranslation, tag: ITag | str) -> ITag | str:
+def translate_tags(
+    translation: argostranslate.translate.ITranslation, tag: ITag | str
+) -> ITag | str:
     """Translate an ITag or str
 
     Recursively takes either an ITag or a str, modifies it in place, and returns the translated tag tree
 
     Args:
-        underlying_translation: The translation to apply
+        translation: The translation to apply
         tag: The tag tree to translate
 
     Returns:
         The translated tag tree
     """
-    if type(tag) is str:
-        return translate_preserve_formatting(underlying_translation, tag)
+    if isinstance(tag, str):
+        return translation.translate(tag)
     elif tag.translateable is False:
         return tag
     elif depth(tag) == 2:
-        tag_injection = inject_tags_inference(underlying_translation, tag)
-        if tag_injection is not None:
-            info("translate_tags", "tag injection successful")
-            return tag_injection
-    else:
-        tag.children = [
-            translate_tags(underlying_translation, child) for child in tag.children
-        ]
+        translated_tag_chunk = translate_tag_chunk(translation, tag)
+        if translated_tag_chunk is not None:
+            return translated_tag_chunk
+    tag.children = [translate_tags(translation, child) for child in tag.children]
 
     return tag

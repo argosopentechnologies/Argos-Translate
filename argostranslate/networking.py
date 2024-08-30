@@ -11,7 +11,7 @@ USER_AGENT = "ArgosTranslate"
 def get_protocol(url: str) -> str | None:
     """Gets the protocol of a URL string
 
-    For example if url is "https://www.argosopentech.com" "https" is returned.
+    For example if url is "https://www.argosopentech.com/" "https" is returned.
     If the protocol can't be determined None is returned
 
     Args:
@@ -40,9 +40,9 @@ def get(url: str, retry_count: int = 3) -> bytes | None:
     Returns:
         The downloaded data, None is returned if the download fails
     """
+    info(f"Get {url}")
     if get_protocol(url) not in supported_protocols:
         return None
-    info(f"Get {url}")
     download_attempts_count = 0
     while download_attempts_count <= retry_count:
         try:

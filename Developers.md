@@ -1,5 +1,7 @@
 # Developers
-Most active development happens in the `v2` branch, please make pull requests there
+Contributions welcome!
+
+Most active development happens in the `v2` branch, please make pull requests there.
 
 ## Running unit tests
 ```

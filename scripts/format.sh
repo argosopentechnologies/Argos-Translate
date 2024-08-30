@@ -1,10 +1,8 @@
 #!/bin/bash
 
 # Format with black
-black argostranslate
-black setup.py
+black argostranslate tests setup.py
 
 # Sort imports with isort
-isort argostranslate
-isort setup.py
+isort argostranslate tests setup.py
 

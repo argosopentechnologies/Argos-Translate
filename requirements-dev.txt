@@ -2,4 +2,5 @@ black
 isort
 pytest
 mypy
+twine
 argostranslategui
